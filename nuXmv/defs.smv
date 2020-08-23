@@ -1,0 +1,102 @@
+--defs.smv
+
+$py(
+def mkcomment(var, val):
+    return "-- {var} = {val}".format(**vars())
+)
+
+-- Number of cores
+$default(NCORES = 2)
+$(mkcomment("NCORES", NCORES))
+
+-- Will break badly with single core
+$py(assert(NCORES >= 2))
+
+-- Program to use as input to core
+-- Use prog_arbitrary for general verification
+$default(PROG_NAME = "prog_arbitrary")
+$(mkcomment("PROG_NAME", PROG_NAME))
+
+-- EU register and memory word size in bytes
+$default(REG_SZ = 2)
+$(mkcomment("REG_SZ", REG_SZ))
+
+-- Amount of regs in EU reg file
+$default(NREGS = 1)
+$(mkcomment("NREGS", NREGS))
+
+-- How many addressable bytes are there in memory
+$default(MEM_SZ = 4)
+$(mkcomment("MEM_SZ", MEM_SZ))
+
+-- Memory initializer value
+$default(MEM_INIT_VAL = 0)
+$(mkcomment("MEM_INIT_VAL", MEM_INIT_VAL))
+
+-- Byte size, in bits
+$default(MEM_BYTE_SZ = 1)
+$(mkcomment("MEM_BYTE_SZ", MEM_BYTE_SZ))
+
+-- Force align minst.addr to make our life easier
+$default(FORCE_ALIGN_MINST = True)
+$(mkcomment("FORCE_ALIGN_MINST", FORCE_ALIGN_MINST))
+
+-- Number of addresses stored by write buffer
+$default(WR_BUF_SZ = 2)
+$(mkcomment("WR_BUF_SZ", WR_BUF_SZ))
+
+-- Stall core whenever the load address is buffered by this
+-- core's write buffer
+$default(CORE_STALL_WB = True)
+$(mkcomment("CORE_STALL_WB", CORE_STALL_WB))
+
+-- Stall core whenever the load address is buffered by some
+-- other core's write buffer
+$default(CORE_STALL_WB_OTHER = True)
+$(mkcomment("CORE_STALL_WB_OTHER", CORE_STALL_WB_OTHER))
+
+-- Whether the write buffer should detect reads from other cores
+$default(WB_SNOOP_OTHER = True)
+$(mkcomment("WB_SNOOP_OTHER", WB_SNOOP_OTHER))
+
+-- Support acquire/release insts
+$default(ACQ_REL_SUPPORT = False)
+$(mkcomment("ACQ_REL_SUPPORT", ACQ_REL_SUPPORT))
+
+-- Force exhaustive verification of all the properties
+-- This will quantify each property over the entire function domain,
+-- generating a property for each argument.
+-- Usually it is sufficient to consider only a small subspace of
+-- the function domain, but we cannot prove this. For
+-- practical purposes, however, we want to avoid exhaustive
+-- quantification.
+$default(V_EXHAUSTIVE = False)
+$(mkcomment("V_EXHAUSTIVE", V_EXHAUSTIVE))
+
+$py(
+import math
+import itertools
+from itertools import product as cartesian
+
+ALL_CORES = ["core%d" % x for x in range(0, NCORES)]
+
+# Register can address exactly every byte in memory
+# Exactly every byte because otherwise address wrapping breaks (memory, cache.smv)
+assert math.log(MEM_SZ, 2) == REG_SZ;
+
+def combinations(it):
+    return itertools.chain.from_iterable(itertools.combinations(it, i + 1) for i in xrange(len(it)))
+
+def forall(objs, p):
+    if (len(objs) == 0):
+        return "TRUE"
+    return "(" + "&".join("(" + p(obj) + ")" for obj in objs) + ")"
+
+def exists(objs, p):
+    if (len(objs) == 0):
+        return "FALSE"
+    return "(" + "|".join("(" + p(obj) + ")" for obj in objs) + ")"
+
+def const(val, sz=REG_SZ):
+    return "uwconst(%s, %s)" % (val, sz)
+)

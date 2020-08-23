@@ -1,0 +1,57 @@
+$py(
+PC_SZ = 3
+NPCS = 2
+)
+
+MODULE prog_slow_consistency($(",".join(ALL_CORES)))
+VAR pcs : array 0..$(NPCS-1) of unsigned word [$(PC_SZ)];
+    wrapped : array 0..$(NPCS-1) of boolean;
+ASSIGN
+$for(i in range(0,NPCS))
+    init(pcs[$(i)]) := uwconst(0, $(PC_SZ));
+    init(wrapped[$(i)]) := FALSE;
+
+    next(pcs[$(i)]) := case
+        core$(i).stalled : pcs[$(i)];
+        !core$(i).stalled : pcs[$(i)] + uwconst(1, $(PC_SZ));
+        TRUE : pcs[$(i)];
+    esac;
+    next(wrapped[$(i)]) := case
+        next(pcs[$(i)]) < pcs[$(i)] : TRUE;
+        TRUE : wrapped[$(i)];
+    esac;
+$endfor
+
+    -- Litmus test: if core1 observed 2 at 0, it may not observe 1 next by any load
+
+    -- core0            core1
+    -- STV 0 <- 1       x
+    -- STV 0 <- 2       LDL r0 <- 0 // stall & flush core0.wb if WB_SNOOP_OTHER
+    -- x                LDL r0 <- 0 // if r0 = 2
+    -- x                x           // prohibited r0 = 1
+
+    core0.minst.addr := $(const(0));
+    core0.minst.kind := case
+        pcs[0] = uwconst(0, $(PC_SZ)) : MEM_INST_STV;
+        pcs[0] = uwconst(1, $(PC_SZ)) : MEM_INST_STV;
+        TRUE : MEM_INST_LDL;
+    esac;
+    core0.minst.val := case
+        pcs[0] = uwconst(0, $(PC_SZ)) : $(const(1));
+        pcs[0] = uwconst(1, $(PC_SZ)) : $(const(2));
+        TRUE : $(const(0));
+    esac;
+
+    core1.minst.addr := $(const(0));
+    core1.minst.kind := MEM_INST_LDL;
+
+$for(core in ALL_CORES[2::])
+    $(core).minst.addr := case
+        $(core).minst.kind = MEM_INST_STV : $(const(2));
+        TRUE : $(const(0));
+    esac;
+$endfor
+
+    -- We do not look past PC wrap, as they go out of sync
+    INVARSPEC !wrapped[1] & pcs[1] = uwconst(2, $(PC_SZ)) -> core1.gprs[0] = $(const(1));
+    INVARSPEC !wrapped[1] & pcs[1] >= uwconst(3, $(PC_SZ)) -> core1.gprs[0] = $(const(2));

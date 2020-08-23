@@ -1,0 +1,151 @@
+-- wr_buf.smv
+
+-- FIXME: Flushes are done in FIFO order now, contributing to SC. We should relax this to see
+-- if our properties detect this.
+
+MODULE wr_buf(cif, -- mem_iface of this core
+    mif, -- mem_iface of underlying memory
+    $(",".join(["coreo%d2wb_if" % x for x in range(0, NCORES - 1)]))) -- mem_iface of other cores
+VAR
+    vals : array 0..$(WR_BUF_SZ-1) of unsigned word [$REG_SZ];
+    addrs : array 0..$(WR_BUF_SZ-1) of unsigned word [$REG_SZ];
+    has : array 0..$(WR_BUF_SZ-1) of boolean;
+
+    -- Encoding:
+    -- FL_ST_NONE: Not in a flush
+    -- FL_ST_ij: Have flushed j out of i+1 elements
+    fl_st : {FL_ST_NONE
+$for(i in range(0, WR_BUF_SZ))
+$for(j in range(0, i+1))
+    , FL_ST_$(i)$(j)
+$endfor
+$endfor
+    };
+    flushing : boolean;
+    full : boolean;
+
+    -- convenience variable for core to determine if it needs to stall
+    -- (usage of next is prohibited in that context)
+    next_flush : boolean;
+
+    rd : array 0..$(WR_BUF_SZ-1) of boolean;
+
+ASSIGN
+    -- Buffered to make life easier for core
+    init(flushing) := FALSE;
+    next(flushing) := next(fl_st) != FL_ST_NONE;
+
+    init(fl_st) := FL_ST_NONE;
+
+    next(fl_st) := case
+        -- Flush state entry
+        -- Enter flush early if we are full next.
+        -- This takes care of cases where we have read of a buffered value from another core, and
+        -- write from our core. The write would get buffered correctly, but the flush would be
+        -- entered too early, and the flush would be incomplete.
+        fl_st = FL_ST_NONE & next(full) : FL_ST_$(WR_BUF_SZ-1)0;
+        -- Since we don't have gaps in buffered locations, it should suffice to only check i+1th
+$for(i in range(0, WR_BUF_SZ))
+        fl_st = FL_ST_NONE & has[$(i)] $( "& !has[%d]" % (i + 1) if i < WR_BUF_SZ-1 else "") &
+        $(exists(range(0, i+1), lambda j: "rd[%d]" % j))
+        -- If we can buffer the next location at this cycle, do not enter flush yet
+$if(i < WR_BUF_SZ-1)
+        & !(cif.op = MEM_OP_W & !has[$(i + 1)])
+$endif
+        :
+        FL_ST_$(i)0;
+$endfor
+
+        -- Intermediate flush states
+$for(i in range(0, WR_BUF_SZ))
+$for(j in range(0, i+1))
+        fl_st = FL_ST_$(i)$(j) :
+$if(i == j)
+        FL_ST_NONE;
+$else
+        FL_ST_$(i)$(j+1);
+$endif
+$endfor
+
+$endfor
+
+        TRUE : fl_st;
+    esac;
+
+    next_flush :=
+        -- We'll enter flush next if there was a read from a buffered address
+    !flushing & (full | $(exists(range(0, WR_BUF_SZ-1), lambda i: "fl_st = FL_ST_NONE & rd[%d] & has[%d]" % (i, i))));
+
+$for(i in range(0, WR_BUF_SZ))
+    init(has[$(i)]) := FALSE;
+$endfor
+
+    full := $(forall(range(0, WR_BUF_SZ), lambda i: "has[%d]" % i));
+
+    -- rd[i] if there's a core reading from that address
+$for(i in range(0, WR_BUF_SZ))
+    rd[$(i)] := ((cif.op = MEM_OP_R & cif.addr = addrs[$(i)])
+$if(WB_SNOOP_OTHER)
+    | $(exists(range(0, NCORES-1), lambda c: "coreo%d2wb_if.op = MEM_OP_R & coreo%d2wb_if.addr = addrs[%d]" % (c, c, i)))
+$endif
+    );
+$endfor
+
+    -- If we can buffer a write, do so (non-coalescing)
+    -- Only buffer a write to this slot if previous slot was occupied
+    -- For determining next(has) we rely on next(fl_st), which only depends on itself
+$for(i in range(0, WR_BUF_SZ))
+    next(vals[$(i)]) := case
+        !flushing & cif.op = MEM_OP_W &
+        $(forall(range(0, i), lambda j: "has[%d]" % j))  & $("!has[%d]" % i) : cif.inw;
+        TRUE : vals[$(i)];
+    esac;
+
+    next(addrs[$(i)]) := case
+        !flushing & cif.op = MEM_OP_W &
+        $(forall(range(0, i), lambda j: "has[%d]" % j))  & $("!has[%d]" % i) : cif.addr;
+        TRUE : addrs[$(i)];
+    esac;
+
+    next(has[$(i)]) := case
+        flushing & next(fl_st) = FL_ST_NONE : FALSE;
+        !flushing & cif.op = MEM_OP_W &
+        $(forall(range(0, i), lambda j: "has[%d]" % j)) & $("!has[%d]" % i) : TRUE;
+        TRUE : has[$(i)];
+    esac;
+$endfor
+
+    mif.op := case
+        -- Our writes
+        flushing : MEM_OP_W;
+        -- Reads from our core
+        !flushing & cif.op = MEM_OP_R : MEM_OP_R;
+        TRUE : MEM_OP_NOP;
+    esac;
+
+    mif.addr := case
+$for(i in range(0, WR_BUF_SZ))
+$for(j in range(0, i+1))
+        fl_st = FL_ST_$(i)$(j) : addrs[$(j)];
+$endfor
+$endfor
+        TRUE : cif.addr;
+    esac;
+
+    mif.inw := case
+$for(i in range(0, WR_BUF_SZ))
+$for(j in range(0, i+1))
+        fl_st = FL_ST_$(i)$(j) : vals[$(j)];
+$endfor
+$endfor
+        TRUE : cif.inw; -- dont care as op != W with !flushing
+    esac;
+
+    -- Ignore any other I/O from coif -- it will be handled by other core wb
+
+-- INVARSPEC fl_st = FL_ST_0 -> has[0];
+
+-- Slot is considered occupied until the entire flush is complete.
+-- In other words, the write buffer does not service any requests during
+-- the flush.
+-- INVARSPEC fl_st in {FL_ST_1, FL_ST_2} -> (has[0] & has[1]);

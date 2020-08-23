@@ -1,0 +1,126 @@
+-- memory.smv
+
+-- FIXME: Not everything is MEM_BYTE_SZ aware
+
+MODULE mem_iface
+VAR
+    addr : unsigned word[$REG_SZ]; -- Memory address for this operation
+    op : {MEM_OP_NOP, MEM_OP_R, MEM_OP_W};
+    inw : unsigned word[$REG_SZ]; -- Word to be written to memory.
+                                      -- REG_SZ/MEM_BYTE_SZ sequential memory bits are
+                                      -- assembled into REG_SZ bits
+    inwb : array 0..$(REG_SZ-1) of unsigned word[$MEM_BYTE_SZ];
+    outw : unsigned word [$REG_SZ];
+    outwb : array 0..$(REG_SZ-1) of unsigned word[$MEM_BYTE_SZ];
+ASSIGN
+$for_begin(i in range(0,REG_SZ))
+$py(j = REG_SZ - 1 - i)
+    inwb[$i] := inw[$(j):$(j)];
+    outwb[$i] := outw[$(j):$(j)];
+$endfor
+
+$begin
+$py(cifs = ",".join(["c%dif" % x for x in range(0, NCORES)]))
+MODULE mem_word(addr, $cifs)
+VAR
+    bytes : array 0..$(REG_SZ-1) of unsigned word[$MEM_BYTE_SZ];
+    asrc : {SRC_NONE, $(",".join(["SRC_C%d" % x for x in range(0, NCORES)]))};
+    outw : unsigned word[$REG_SZ];
+
+    -- Is all the write I/O to this word aligned
+    aligned_srcs : array 0..$(NCORES-1) of boolean;
+
+DEFINE
+    all_aligned :=
+$for(i in range(0, NCORES))
+        aligned_srcs[$i] &
+$endfor
+    TRUE;
+
+ASSIGN
+$for(i in range(0,REG_SZ))
+init(bytes[$i]) := uwconst($MEM_INIT_VAL, $MEM_BYTE_SZ);
+$endfor
+
+    -- All write I/O is aligned if it only touches the aligned memory in this word
+$for(i in range(0,NCORES))\
+aligned_srcs[$i] := c$(i)if.op != MEM_OP_W |
+case
+    -- Disallow wrap around to first word from the end of the address space.
+    addr = uwconst(0, $REG_SZ) : c$(i)if.addr = uwconst(0, $REG_SZ) |
+                                    (c$(i)if.addr >= addr + uwconst($REG_SZ, $REG_SZ) &
+                                    c$(i)if.addr <= uwconst($(MEM_SZ - REG_SZ), $REG_SZ));
+    -- Special case for the last word
+    addr + uwconst($REG_SZ, $REG_SZ) = uwconst(0, $REG_SZ) : c$(i)if.addr = addr |
+                                                    c$(i)if.addr <= addr - uwconst($REG_SZ, $REG_SZ);
+    -- Not first or last word
+    TRUE : c$(i)if.addr = addr | c$(i)if.addr >= addr + uwconst($REG_SZ, $REG_SZ) | c$(i)if.addr <= addr - uwconst($REG_SZ, $REG_SZ);
+esac;
+$endfor\
+
+    -- If we have multiple aligned writes, select just one source and use it next
+    -- Because case is priority-ordered, we start with longest subsets of ifaces in order to allow
+    -- non-deterministic asrc choice (allowed to be unfair)
+    asrc := case
+$py(cs_combs = sorted(list(combinations(range(0,NCORES))), key=lambda l: len(l))[::-1])
+$for(cs in cs_combs)
+    $(forall(cs, lambda c: "c%dif.addr = addr & c%dif.op = MEM_OP_W" % (c, c)))
+        : {$(",".join(["SRC_C%d" % x for x in cs]))};
+$endfor
+        TRUE : SRC_NONE;
+    esac;
+
+    -- If all writes are aligned, then pick one according to asrc
+    -- If there is a non-aligned concurrent write to this byte, any write source may be used,
+    -- or the old value may be retained. This corresponds to undefined behaviour in C.
+    -- If no write occured to this address at all, retain the previous value
+
+    -- FIXME: Use bit subranges or nested arrays for general case
+$for(b in range(0,REG_SZ))
+    next(bytes[$b]) := all_aligned ? (
+        case
+$for(i in range(0,NCORES))
+            asrc = SRC_C$(i) : c$(i)if.inwb[$b];
+$endfor
+            TRUE : bytes[$b];
+        esac
+        ) :
+        case
+        -- Unaligned possibly concurrent write: select a byte
+        -- FIXME: Priority-ordered; could be made less deterministic
+$for(i in range(0,NCORES))
+$for(bc in range(0,REG_SZ))
+            (c$(i)if.op = MEM_OP_W & c$(i)if.addr + uwconst($bc,$REG_SZ) = addr + uwconst($b,$REG_SZ)) : c$(i)if.inwb[$bc];
+$endfor
+$endfor
+            TRUE : bytes[$b];
+        esac;
+$endfor
+
+    -- Expose bytes array as a word
+    outw := $("::".join(["bytes[%d]" % x for x in range(0, REG_SZ)]));
+
+    INVARSPEC (toint(addr) mod $REG_SZ = 0); -- Word address is word-aligned
+$if(FORCE_ALIGN_MINST)
+    INVARSPEC all_aligned;
+$endif
+
+MODULE memory($cifs)
+VAR
+$for(i in range(0,MEM_SZ / REG_SZ))
+    w$(i) : mem_word(uwconst($(i * REG_SZ), $REG_SZ), $cifs);
+$endfor
+ASSIGN
+    -- FIXME: Technically, we dont need MEM_OP_R...
+$for(i in range(0,NCORES))
+c$(i)if.outw := case
+$for(b in range(0,MEM_SZ))
+    c$(i)if.addr = uwconst($b, $REG_SZ) :
+        $("::".join(["w%d.bytes[%d]" % (((b + x) % MEM_SZ) / (MEM_SZ / REG_SZ), (b + x) % REG_SZ) for x in range(REG_SZ - 1, -1, -1)][::-1]));
+$endfor
+    -- Silence the totality warning -- if we do generate by mistake a non-total table, our
+    -- properties should expose it.
+    TRUE : w0.outw;
+    esac;
+$endfor
+$end

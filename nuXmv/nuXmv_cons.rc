@@ -1,0 +1,8 @@
+# Turns out this just checks whether the conjunction of the specified properties does not
+# hold -- rather useless for us
+
+source "../nuXmv.rc"
+
+reqan_check_consistency -e ic3
+show_traces -a -o cons_cex.xml
+quit

@@ -1,0 +1,42 @@
+$py(PC_SZ = 3)
+
+MODULE prog_local_consistency($(",".join(ALL_CORES)))
+VAR pc : unsigned word [$(PC_SZ)];
+ASSIGN
+    init(pc) := uwconst(0, $(PC_SZ));
+    next(pc) := case
+        core0.stalled : pc;
+        !core0.stalled : pc + uwconst(1, $(PC_SZ));
+        TRUE : pc;
+    esac;
+
+    -- core0:
+    -- STV 0 <- 1
+    -- STV 0 <- 2
+    -- LDL r0 <- 0
+    -- // expect r0 != 1
+
+    -- other cores:
+    -- anything, as long as it does not interfere with core0
+
+    core0.minst.addr := $(const(0));
+    core0.minst.kind := case
+        pc = uwconst(0, $(PC_SZ)) : MEM_INST_STV;
+        pc = uwconst(1, $(PC_SZ)) : MEM_INST_STV;
+        pc = uwconst(2, $(PC_SZ)) : MEM_INST_LDL;
+        TRUE : MEM_INST_LDL;
+    esac;
+    core0.minst.val := case
+        pc = uwconst(0, $(PC_SZ)) : $(const(1));
+        pc = uwconst(1, $(PC_SZ)) : $(const(2));
+        TRUE : $(const(0));
+    esac;
+
+$for(core in ALL_CORES[1::])
+    $(core).minst.addr := case
+        $(core).minst.kind = MEM_INST_STV : $(const(2));
+        TRUE : $(const(0));
+    esac;
+$endfor
+
+    INVARSPEC pc = uwconst(4, $(PC_SZ)) -> core0.gprs[0] != $(const(1));

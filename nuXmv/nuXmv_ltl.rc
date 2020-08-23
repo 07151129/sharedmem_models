@@ -1,0 +1,8 @@
+source "../nuXmv.rc"
+
+go_msat
+build_boolean_model
+check_ltlspec_ic3
+
+show_traces -a -o ltl_cex.xml
+quit

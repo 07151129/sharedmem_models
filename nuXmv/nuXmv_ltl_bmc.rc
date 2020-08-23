@@ -1,0 +1,12 @@
+source "../nuXmv.rc"
+
+flatten_hierarchy
+encode_variables
+build_boolean_model
+
+bmc_setup
+go_bmc
+check_ltlspec_bmc -k 20
+
+show_traces -a -o ltl_cex.xml
+quit

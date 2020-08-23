@@ -1,0 +1,87 @@
+-- core.smv
+
+$begin
+$py(other_cores = ["coreo%d" % x for x in range(0, NCORES - 1)])
+
+MODULE core(mem_if, $(",".join(other_cores)))
+VAR
+    gprs : array 0..$(NREGS-1) of unsigned word[$REG_SZ];
+
+    minst : mem_inst; -- input
+    minstb : mem_inst; -- buffered instruction
+
+    core2wb_if : mem_iface;
+
+    wb : wr_buf(core2wb_if, mem_if,
+        $(",".join(["%s.core2wb_if" % c for c in other_cores])));
+
+    stalled : boolean;
+
+ASSIGN
+    init(gprs[0]) := $(const(MEM_INIT_VAL));
+
+    next(gprs[0]) := case
+        -- Address being read is not in write buffer,
+        -- so it is safe to fetch the value from memory directly
+        !stalled & minstb.kind = MEM_INST_LDL : mem_if.outw;
+        TRUE : gprs[0];
+    esac;
+
+    -- We must stall if:
+    -- 1. WB is busy flushing, so we can't access the memory at all
+    -- 2. We're doing a read from a location that is contained by WB of this core
+    -- 3. (2) but for other cores
+    stalled :=
+        wb.flushing
+$if(CORE_STALL_WB)
+        | (minstb.kind = MEM_INST_LDL & $(exists(range(0, WR_BUF_SZ), lambda i: "wb.has[{i}] & wb.addrs[{i}] = minstb.addr".format(i=i))))
+$endif
+$if(CORE_STALL_WB_OTHER)
+        | (minstb.kind = MEM_INST_LDL &
+            $(exists(other_cores, lambda c: exists(range(0, WR_BUF_SZ), lambda i: "{core}.wb.has[{i}] & {core}.wb.addrs[{i}] = minstb.addr".format(core=c,i=i)))))
+$endif
+    ;
+
+    init(minstb.kind) := minst.kind;
+    init(minstb.val) := minst.val;
+    init(minstb.addr) :=
+$if(FORCE_ALIGN_MINST)
+    minst.addr mod $(const(REG_SZ)) != $(const(0)) ?
+            minst.addr + (minst.addr mod $(const(REG_SZ))): minst.addr;
+$else
+    minst.addr;
+$endif
+
+    -- If the current instruction will cause wb flush, we must buffer it until end of flush
+    next(minstb.kind) := case
+        stalled : minstb.kind;
+        TRUE : minst.kind;
+    esac;
+
+    next(minstb.val) := case
+        stalled : minstb.val;
+        TRUE : minst.val;
+    esac;
+
+    next(minstb.addr) := case
+        stalled : minstb.addr;
+$if(FORCE_ALIGN_MINST)
+        TRUE : minst.addr mod $(const(REG_SZ)) != $(const(0)) ?
+            minst.addr + (minst.addr mod $(const(REG_SZ))): minst.addr;
+$else
+        TRUE : minst.addr;
+$endif
+    esac;
+
+    core2wb_if.addr := minstb.addr;
+    core2wb_if.op := case
+        minstb.kind = MEM_INST_LDL : MEM_OP_R;
+        minstb.kind = MEM_INST_STV : MEM_OP_W;
+        TRUE : MEM_OP_NOP;
+    esac;
+
+    core2wb_if.inw := case
+        minstb.kind = MEM_INST_STV : minstb.val;
+        TRUE : minstb.val;
+    esac;
+$end

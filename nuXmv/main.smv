@@ -1,0 +1,24 @@
+-- main.smv
+
+MODULE main
+
+-- JUSTICE TRUE;
+
+VAR
+$for_begin(i in range(0, NCORES))
+$py(other_cores = ",".join(["core%d" % x for x in filter(lambda x: x != i, range(0, NCORES))]))
+    core$(i) : core(c$(i)mif,$(other_cores));
+    c$(i)mif : mem_iface;
+$endfor
+    mem : memory($(",".join(["c%dmif" % x for x in range(0, NCORES)])));
+    prog : $(PROG_NAME)($(",".join(ALL_CORES)));
+
+    v_cores : v_core($(",".join(ALL_CORES)));
+
+-- prog_arbitrary leaves core.minst undriven so that it gets arbitrary value
+MODULE prog_arbitrary($(",".join(ALL_CORES)))
+
+-- Another program may be selected via PROG_NAME config variable.
+-- These programs contain invariants about possible execution to check if an outcome is indeed
+-- prohibited by the model.
+-- This helps in ensuring that the LTL consistency properties also catch the undesirable behaviour.

@@ -1,0 +1,8 @@
+source "../nuXmv.rc"
+
+#set cone_of_influence 1
+go_msat
+check_invar_ic3
+
+show_traces -a -o invar_cex.xml
+quit

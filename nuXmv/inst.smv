@@ -1,0 +1,18 @@
+-- inst.smv
+
+MODULE mem_inst
+VAR
+    kind : {MEM_INST_LDL, -- Load from mem address to reg
+
+        -- Store (arbitrary) val to address. This is needed so we abstract over the
+        -- rest of the ISA -- we need not implement e.g. arithmetics to obtain every single possible
+        -- value. If we dont have this instruction, then we only work with data that was once
+        -- used to initialise registers or memory, which limits our scope greatly.
+        MEM_INST_STV,
+        MEM_INST_NOP
+    };
+    val : unsigned word[$REG_SZ]; -- value for MEM_INST_STV
+    addr : unsigned word[$REG_SZ]; -- memory address
+$if(ACQ_REL_SUPPORT)
+    acq_rel : boolean;
+$endif

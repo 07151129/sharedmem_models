@@ -1,0 +1,245 @@
+-- v_core.smv
+
+-- This was originally meant to be a v_core for each core, but it turned out to be annoying to access
+-- variables of other v_cores.
+
+MODULE v_core($(",".join(ALL_CORES)))
+
+-- Value gets written to write buffer
+$for(core in ALL_CORES)
+$for(i in range(0, WR_BUF_SZ))
+INVARSPEC ($(core).minstb.kind = MEM_INST_STV &
+          !$(core).wb.flushing & !next($(core).wb.flushing) &
+          !$(core).wb.has[$(i)] & $(forall(range(0, i), lambda j: "{core}.wb.has[{j}]".format(core=core,j=j)))
+          ->
+          next($(core).wb.has[$(i)]) &
+          next($(core).wb.addrs[$(i)]) = $(core).minstb.addr &
+          ($(core).minstb.kind = MEM_INST_STV -> next($(core).wb.vals[$(i)]) = $(core).minstb.val));
+$endfor
+$endfor
+
+-- Flush eventually terminates within WR_BUF_SZ cycles
+$for(core in (ALL_CORES if V_EXHAUSTIVE else ["core0"]))
+LTLSPEC G (!$(core).wb.flushing & next($(core).wb.flushing) -> F [1, $(WR_BUF_SZ)] !$(core).wb.flushing);
+$endfor
+LTLSPEC G (core0.wb.flushing -> F [0, $(WR_BUF_SZ)] !core0.wb.flushing);
+
+-- A core is never stalled forever
+$for(core in (ALL_CORES if V_EXHAUSTIVE else ["core0"]))
+LTLSPEC G ($(core).stalled -> F !$(core).stalled);
+$endfor
+
+$begin
+$py(
+assert NREGS == 1, "Update the properties to work with multiple registers."
+
+def WeakUntil(p, q):
+  return "(({p}) U ({q}) | G ({p}))".format(**vars())
+
+def LoadFrom(core, addr):
+  ld_from_addr = "({core}.minstb.kind = MEM_INST_LDL & {core}.minstb.addr = {addr})".format(**vars())
+  return ld_from_addr
+
+def LoadFromVal(core, addr, val):
+  ld_from_addr = LoadFrom(core, addr)
+  stalled_until = WeakUntil("{ld_from_addr} & {core}.stalled".format(**vars()),
+    "!{core}.stalled & (X {core}.gprs[0] = {val})".format(**vars()))
+  return ("({ld_from_addr} & "
+"((!{core}.stalled -> X {core}.gprs[0] = {val})) &"
+"(({core}.stalled -> {stalled_until})))").format(**vars())
+
+# This is supposed to match execution of load from the time it's first issued until it terminates.
+# Originally we required a stall to always terminate, but this turned out to be not the case.
+def Observes(core, addr, val):
+  ld_from_addr = LoadFrom(core, addr)
+  stalled_until = "(({ld_from_addr} & {core}.stalled) U (!{core}.stalled & X {core}.gprs[0] = {val}))".format(**vars())
+#  stalled_until = WeakUntil("{ld_from_addr} & {core}.stalled".format(**vars()),
+#    "!{core}.stalled & (X {core}.gprs[0] = {val})".format(**vars()))
+  return ("("
+"{ld_from_addr} & ((!{core}.stalled -> X {core}.gprs[0] = {val})) &"
+"(({core}.stalled -> {stalled_until})))").format(**vars())
+
+#def Observes(c, a, v):
+#  ld = LoadFrom(c, a)
+#  nstalled = "(Y ! {c}.stalled)".format(**vars())
+#  nstalled_v = "(!{c}.stalled -> X {c}.gprs[0] = {v})".format(**vars())
+#  stalled_until = WeakUntil("{c}.stalled & {ld}".format(**vars()), "!{c}.stalled & X {c}.gprs[0] = {v}".format(**vars()))
+#  stalled_v = "({c}.stalled -> {stalled_until})".format(**vars())
+#  return "(({ld} & {nstalled}) -> ({nstalled_v} & {stalled_v}))".format(**vars())
+
+def StoreTo(core, addr):
+  st_to = "({core}.minstb.kind = MEM_INST_STV & {core}.minstb.addr = {addr} & Y !{core}.stalled)".format(**vars())
+  return st_to
+
+def StoreToVal(core, addr, val):
+  st_to = StoreTo(core, addr)
+  return "({st_to} & {core}.minstb.val = {val})".format(**vars())
+
+OBSERVED_ADDRS = range(0, 2**REG_SZ, REG_SZ)
+OBSERVED_VALS = range(0, 2**REG_SZ)
+
+def Initial(c, a, v):
+  if v != MEM_INIT_VAL:
+    return "FALSE"
+  ret = forall(map(const, filter(lambda v: v != MEM_INIT_VAL, OBSERVED_VALS)), lambda v: "!O {st}".format(st = StoreToVal(c, a, v)))
+  return ret
+
+def LastStore(c, a, v):
+  ret = forall(map(const, filter(lambda v_: v_ != v, OBSERVED_VALS)),
+    lambda v_: "!{st_cav_} S {st_cav}".format(
+      st_cav_ = StoreToVal(c, a, v_),
+      st_cav = StoreToVal(c, a, v)))
+  return ret
+)
+
+$for(core in ALL_CORES)
+$for(a in OBSERVED_ADDRS)
+VAR $(core)_observed_addr$(a) : unsigned word[$REG_SZ];
+ASSIGN
+init($(core)_observed_addr$(a)) := $(core).gprs[0];
+next($(core)_observed_addr$(a)) := case
+-- This load will terminate next if we're not stalled now
+-- This uses the same logic as gprs[0] update, but for a fixed address
+  $(core).minstb.kind = MEM_INST_LDL & $(core).minstb.addr = $(const(a)) & !$(core).stalled:
+    $(core).mem_if.outw; -- Previously there was next(gprs), but this caused desync with core
+  TRUE : $(core)_observed_addr$(a);
+esac;
+$endfor
+$endfor
+
+-- Flush will only be entered if:
+-- WB is full
+-- has[i] and read has been generated from addrs[i] by the owning core
+-- If WB_SNOOP_OTHER, same as prev. but from any core
+$for(core in (ALL_CORES if V_EXHAUSTIVE else ["core0"]))
+LTLSPEC G (!$(core).wb.flushing & next($(core).wb.flushing) ->
+    next($(core).wb.full) |
+    $(exists(OBSERVED_ADDRS, lambda addr: LoadFrom(core, const(addr)) + " & " + exists(range(0, WR_BUF_SZ), lambda i: "{core}.wb.has[{i}] & {core}.wb.addrs[{i}] = {addr}".format(core=core, i=i, addr=const(addr)))))
+$if(WB_SNOOP_OTHER)
+    | $(exists(ALL_CORES, lambda c1: exists(OBSERVED_ADDRS, lambda addr: LoadFrom(c1, const(addr)) + " & " + exists(range(0, WR_BUF_SZ), lambda i: "{core}.wb.has[{i}] & {core}.wb.addrs[{i}] = {addr}".format(core=core, i=i, addr=const(addr))))))
+$endif
+    );
+$endfor
+
+-- Definition of Observes corresponds to our update of observed: observed val
+-- is updated only by register update as a result of a load from the addr.
+-- Unused for now (constistency properties do not rely on observed_addr anymore.)
+$if(V_EXHAUSTIVE)
+$for(core in ALL_CORES)
+$for(addr in OBSERVED_ADDRS)
+  -- LTLSPEC G ($(Observes(core, const(addr), "%s_observed_addr%d" % (core, addr))));
+$endfor
+$endfor
+$else
+  -- LTLSPEC G ($(Observes("core0", const(0), "core0_observed_addr0")));
+$endif
+
+-- Observation is exclusive: we cannot observe two different values in the same trace at the same
+-- cycle.
+-- Note that LHS has to be LoadFromVal -- because Observes is an implication, we would get
+-- counterexamples where LHS is trivially true.
+$if(V_EXHAUSTIVE)
+$for(core in ALL_CORES)
+$for(addr in OBSERVED_ADDRS)
+$for((v1,v2) in cartesian(OBSERVED_VALS,OBSERVED_VALS))
+$if(v1 != v2)
+  -- LTLSPEC G ($(LoadFromVal(core, const(addr), const(v1))) -> !$(Observes(core, const(addr), const(v2))));
+$endif
+$endfor
+$endfor
+$endfor
+$else
+  -- LTLSPEC G ($(LoadFromVal("core0", const(0), const(0))) -> !$(Observes("core0", const(0), const(2))));
+$endif
+
+$py(
+def ObservesInitialVal(core, addr):
+  i = const(MEM_INIT_VAL)
+  return "({core}_observed_addr{addr} = {i})".format(**vars())
+
+def ObservesCoherentVal(core, val, addr, initial=False):
+  st_prev = exists(ALL_CORES, lambda c: StoreToVal(c, const(addr), val)) if not initial else "(%s | %s)" % (StoreTo(core, const(addr)), ObservesInitialVal(core, addr))
+  return "({core}_observed_addr{addr} = {val} -> (O {st_prev}))".format(**vars())
+)
+
+$if(V_EXHAUSTIVE)
+$for((core,a,val) in cartesian(ALL_CORES,OBSERVED_ADDRS,OBSERVED_VALS))
+  --LTLSPEC G $(ObservesCoherentVal(core, const(val), a, val == MEM_INIT_VAL));
+$endfor
+$else
+-- LTLSPEC G $(ObservesCoherentVal("core0", const(0), 0, 0 == MEM_INIT_VAL));
+$endif
+
+$py(
+def LocalConsistency(c, a, v):
+  obs = Observes(c, a, v)
+  ls = LastStore(c, a, v)
+  other_st = exists(filter(lambda c_: c_ != c, ALL_CORES),
+    lambda c_: "O {st_to} | F {st_to}".format(st_to = StoreToVal(c_, a, v)))
+  initial = Initial(c, a, v)
+  return "({obs} -> ({ls} | {other_st} | {initial}))".format(**vars())
+)
+
+-- Local consistency
+$if(V_EXHAUSTIVE)
+$for((c, a, v) in cartesian(ALL_CORES, OBSERVED_ADDRS, OBSERVED_VALS))
+  LTLSPEC G $(LocalConsistency(c, const(a), const(v)));
+$endfor
+$else
+  LTLSPEC G $(LocalConsistency("core0", const(2), const(2)));
+$endif
+
+$py(
+def ObservesOther(c, a, v, Psi):
+  st_other = lambda c_, v_: "({Psi} ({st_c_av} & O {st_c_av_} & !F {st_c_av_}))".format(
+    st_c_av = StoreToVal(c_, a, v),
+    st_c_av_ = StoreToVal(c_, a, v_),
+    Psi=Psi)
+  obs = lambda c_, v_: "G ({obs_cav_} -> {ls_cav_} | {init_cav_} | {st_c__})".format(
+    obs_cav_ = Observes(c, a, v_),
+    ls_cav_ = LastStore(c, a, v_),
+    init_cav_ = Initial(c, a, v_),
+    st_c__ = exists(filter(lambda c__: c__ != c_, ALL_CORES), lambda c__: "(O {st_c__av_} | F {st_c__av_})".format(st_c__av_ = StoreToVal(c__,a,v_), **vars())),
+    **vars()
+    )
+  ex_other = exists(filter(lambda c_: c_ != c, ALL_CORES), lambda c_:
+    forall(filter(lambda v_: v_ != v, map(const, OBSERVED_VALS)), lambda v_:
+        "({Psi} {st_c_av} & {st_other_c_v_}) -> {obs_c_v_}".format(
+            st_other_c_v_=st_other(c_,v_),
+            obs_c_v_=obs(c_,v_),
+            Psi=Psi,
+            st_c_av = StoreToVal(c_,a,v)
+            )))
+  return "{ex_other}".format(**vars())
+
+def SlowConsistency(c, a, v):
+    obs = Observes(c, a, v)
+    ls = LastStore(c, a, v)
+    init = Initial(c, a, v)
+    obs_other_O = ObservesOther(c, a, v, "O")
+    obs_other_F = ObservesOther(c, a, v, "F")
+
+    return "({obs} -> ({ls} | {init} | {obs_other_O} | {obs_other_F}))".format(**vars())
+
+def UniqueObserves():
+  cav = list(cartesian(ALL_CORES, map(const, OBSERVED_ADDRS), map(const, OBSERVED_VALS)))
+  return forall(cav, lambda cav: "G {obs_cav} -> (X !F {obs_cav})".format(obs_cav = Observes(*cav)))
+
+def UniqueSt():
+  cav = list(cartesian(ALL_CORES, map(const, OBSERVED_ADDRS), map(const, OBSERVED_VALS)))
+  return forall(cav, lambda cav: "G {st_cav} -> (X !F {st_cav})".format(st_cav = StoreToVal(*cav)))
+
+def UniqueSlowConsistency(c, a, v):
+  return "(({ust} & {uobs}) -> {slc_cav})".format(ust = UniqueSt(), uobs = UniqueObserves(), slc_cav = SlowConsistency(c, a, v))
+)
+
+-- Slow consistency
+$if(V_EXHAUSTIVE)
+$for((c, a, v) in cartesian(ALL_CORES, OBSERVED_ADDRS, OBSERVED_VALS))
+  LTLSPEC G $(SlowConsistency(c, const(a), const(v)));
+$endfor
+$else
+  LTLSPEC G $(SlowConsistency("core0", const(2), const(2)));
+$endif
+
+$end

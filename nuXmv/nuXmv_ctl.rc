@@ -1,0 +1,8 @@
+source "../nuXmv.rc"
+
+set cone_of_influence 1
+go_msat
+check_ctlspec
+
+show_traces -a -o ctl_cex.xml
+quit

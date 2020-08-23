@@ -1,0 +1,11 @@
+set on_failure_script_quits 1
+set default_trace_plugin 4 # detailed XML
+#set pp_list "cpp"
+read_model -i model.pp.smv
+
+go_msat
+build_boolean_model
+check_ltlspec_ic3 -p "G X TRUE"
+#bmc_setup; check_pslspec_sbmc
+show_traces -a -o cex.xml
+quit

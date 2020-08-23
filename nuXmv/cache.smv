@@ -1,0 +1,113 @@
+-- cache.smv
+
+-- Adapted from memory.smv with the difference that we do not need concurrent I/O here
+MODULE cache_word(addr, caif) -- FIXME: Generate this
+VAR
+    bytes : array 0..$(REG_SZ-1) of unsigned word[$MEM_BYTE_SZ];
+    outw : unsigned word[$REG_SZ];
+    present : boolean;
+DEFINE
+    one_uw := uwconst(1, $REG_SZ);
+ASSIGN
+    init(present) := FALSE;
+
+    -- FIXME: Use bit subranges or nested arrays for general case
+    next(bytes[0]) :=
+        case
+            caif.addr = addr & caif.op = MEM_OP_W : caif.inwb[0];
+            caif.addr = addr - one_uw & caif.op = MEM_OP_W : caif.inwb[1];
+            TRUE : bytes[0];
+        esac;
+
+    -- Propagate bytes if needed
+    next(bytes[1]) :=
+        case
+            caif.addr = addr & caif.op = MEM_OP_W : caif.inwb[1];
+            caif.addr = addr + one_uw & caif.op = MEM_OP_W : caif.inwb[1];
+            TRUE : bytes[1];
+        esac;
+
+    -- Expose bytes array as a word
+    outw := bytes[1] :: bytes[0];
+
+    INVARSPEC (toint(addr) mod $REG_SZ = 0); -- Word address is word-aligned
+
+-- NOTE: This cache does not provide any consistency or coherence guarantees.
+-- We hope to expose this at verification stage.
+
+-- FIXME: We cache the entire memory here so there is no need for tags for now
+-- This also implies we only get compulsory misses -- every other access will be a hit
+
+MODULE cache(hif, -- mem_iface of higher level (core or wb)
+            lif) -- mem_iface of lower level (memory)
+VAR
+    caif : mem_iface;
+
+    w0 : cache_word(uwconst(0, $REG_SZ), caif);
+    w1 : cache_word(uwconst(2, $REG_SZ), caif);
+
+    present : boolean; -- value accessed from higher level is present in cache
+
+    st : {CACHE_W_HIT, CACHE_W_MISS, CACHE_R_HIT, CACHE_R_MISS};
+
+ASSIGN
+    present := case
+        hif.addr = w0.addr : w0.present;
+        hif.addr = w1.addr : w1.present;
+        -- Word-spanning I/O (FIXME)
+        TRUE : w0.present & w1.present;
+    esac;
+
+    st := case
+        hif.op = MEM_OP_W & present : CACHE_W_HIT;
+        hif.op = MEM_OP_W & !present : CACHE_W_MISS;
+        hif.op = MEM_OP_R & present : CACHE_R_HIT;
+        hif.op = MEM_OP_R & !present : CACHE_R_MISS;
+        TRUE : CACHE_R_HIT;
+    esac;
+
+    -- We always provide cached value to higher level.
+    -- If it is not present, higher level is responsible for stalling
+    hif.outw := st != CACHE_R_MISS & !hif.uncached ?
+    (case
+        hif.addr = w0.addr : w0.outw;
+        hif.addr = w1.addr : w1.outw;
+        hif.addr = w0.addr - w0.one_uw : w1.bytes[1] :: w0.bytes[0];
+        hif.addr = w0.addr + w0.one_uw : w0.bytes[1] :: w1.bytes[0];
+        TRUE : w0.outw;
+    esac) :
+    lif.outw;
+
+    -- Write miss: just pass write to caif for corresponding location, and evict affected lines if
+    -- needed (FIXME: No eviction needed or implemented here)
+    -- Write hit: pass the write to caif
+    -- Read hit: pass the read to caif
+    -- Read miss: generate lif to caif write
+
+    caif.inw := st != CACHE_R_MISS ? hif.inw : lif.outw;
+    caif.addr := hif.addr;
+    caif.op := case
+        !hif.uncached & st != CACHE_R_MISS : hif.op;
+        !hif.uncached & st = CACHE_R_MISS : MEM_OP_W;
+        TRUE : MEM_OP_NOP;
+    esac;
+
+    lif.addr := caif.addr;
+    lif.op := case
+        hif.uncached : hif.op;
+        TRUE : MEM_OP_R;  -- OK to do this: we ignore lif.outw if needed
+    esac;
+    -- FIXME: Drive lif.inw for flushing/sync
+
+    -- FIXME: Only compulsory misses for now
+    next(w0.present) := case
+        hif.uncached : w0.present;
+        !w0.present & hif.addr = w0.addr & st in {CACHE_W_MISS, CACHE_R_MISS} : TRUE;
+        TRUE : w0.present;
+    esac;
+
+    next(w1.present) := case
+        hif.uncached : w1.present;
+        !w1.present & hif.addr = w1.addr & st in {CACHE_W_MISS, CACHE_R_MISS} : TRUE;
+        TRUE : w1.present;
+    esac;
