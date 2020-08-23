@@ -1,0 +1,16 @@
+Prerequisites:
+- nuXmv (https://nuxmv.fbk.eu)
+- Make (https://www.gnu.org/software/make/)
+- pyexpander with Python 2 (https://pyexpander.sourceforge.io)
+
+Set the NUXMV and EXPANDER environment variables in the Makefile to the respective paths.
+
+Run `make` to preprocess the *.smv files into build/model.pp.smv.
+Run `make ltl` to perform LTL property verification using IC3.
+Run `make ltl_bmc` to perform LTL property verification using BMC.
+
+If a property is found to be false, nuXmv prints the failing property, and outputs the counterexample
+to build/N_ltl_cex.xml for the failing property in that order.
+
+The counterexamples can be translated to programs using trace2prog.py, e.g. by running
+`./trace2prog.py build/1_cex_ltl.xml`

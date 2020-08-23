@@ -1,0 +1,4 @@
+A SystemVerilog 2009 compliant model checker is required.
+
+Verification has been tested with VC Formal and JasperGold, see model_mem_jg.tcl and
+model_mem_vcf.tcl respectively.
